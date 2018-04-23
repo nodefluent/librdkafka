@@ -25,7 +25,8 @@
  * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
  * POSSIBILITY OF SUCH DAMAGE.
  */
-#pragma once
+#ifndef _RDKAFKA_BUF_H_
+#define _RDKAFKA_BUF_H_
 
 #include "rdkafka_int.h"
 #include "rdcrc32.h"
@@ -154,25 +155,57 @@ rd_tmpabuf_write_str0 (const char *func, int line,
  * Assumptions:
  *   - an 'err_parse:' goto-label must be available for error bailouts,
  *                     the error code will be set in rkbuf->rkbuf_err
+ *   - local `int log_decode_errors` variable set to the logging level
+ *     to log parse errors (or 0 to turn off logging).
  */
 
 #define rd_kafka_buf_parse_fail(rkbuf,...) do {				\
-                if (log_decode_errors) {                                \
+                if (log_decode_errors > 0) {                            \
 			rd_kafka_assert(NULL, rkbuf->rkbuf_rkb);	\
-                        rd_rkb_log(rkbuf->rkbuf_rkb, LOG_WARNING, "PROTOERR", \
+                        rd_rkb_log(rkbuf->rkbuf_rkb, log_decode_errors, \
+                                   "PROTOERR",                          \
                                    "Protocol parse failure "            \
                                    "at %"PRIusz"/%"PRIusz" (%s:%i) "    \
                                    "(incorrect broker.version.fallback?)", \
                                    rd_slice_offset(&rkbuf->rkbuf_reader), \
                                    rd_slice_size(&rkbuf->rkbuf_reader), \
                                    __FUNCTION__, __LINE__);             \
-                        rd_rkb_log(rkbuf->rkbuf_rkb, LOG_WARNING,	\
+                        rd_rkb_log(rkbuf->rkbuf_rkb, log_decode_errors, \
 				   "PROTOERR", __VA_ARGS__);		\
                 }                                                       \
                 (rkbuf)->rkbuf_err = RD_KAFKA_RESP_ERR__BAD_MSG;        \
                 goto err_parse;                                         \
 	} while (0)
 
+/**
+ * @name Fail buffer reading due to buffer underflow.
+ */
+#define rd_kafka_buf_underflow_fail(rkbuf,wantedlen,...) do {           \
+                if (log_decode_errors > 0) {                            \
+                        rd_kafka_assert(NULL, rkbuf->rkbuf_rkb);        \
+                        char __tmpstr[256];                             \
+                        rd_snprintf(__tmpstr, sizeof(__tmpstr),         \
+                                    ": " __VA_ARGS__);                  \
+                        if (strlen(__tmpstr) == 2) __tmpstr[0] = '\0';  \
+                        rd_rkb_log(rkbuf->rkbuf_rkb, log_decode_errors, \
+                                   "PROTOUFLOW",                        \
+                                   "Protocol read buffer underflow "    \
+                                   "at %"PRIusz"/%"PRIusz" (%s:%i): "   \
+                                   "expected %"PRIusz" bytes > "        \
+                                   "%"PRIusz" remaining bytes (%s)%s",  \
+                                   rd_slice_offset(&rkbuf->rkbuf_reader), \
+                                   rd_slice_size(&rkbuf->rkbuf_reader), \
+                                   __FUNCTION__, __LINE__,              \
+                                   wantedlen,                           \
+                                   rd_slice_remains(&rkbuf->rkbuf_reader), \
+                                   rkbuf->rkbuf_uflow_mitigation ?      \
+                                   rkbuf->rkbuf_uflow_mitigation :      \
+                                   "incorrect broker.version.fallback?", \
+                                   __tmpstr);                           \
+                }                                                       \
+                (rkbuf)->rkbuf_err = RD_KAFKA_RESP_ERR__UNDERFLOW;      \
+                goto err_parse;                                         \
+        } while (0)
 
 
 /**
@@ -187,13 +220,7 @@ rd_tmpabuf_write_str0 (const char *func, int line,
 #define rd_kafka_buf_check_len(rkbuf,len) do {                          \
                 size_t __len0 = (size_t)(len);                          \
                 if (unlikely(__len0 > rd_kafka_buf_read_remain(rkbuf))) { \
-                        rd_kafka_buf_parse_fail(                        \
-                                rkbuf,                                  \
-                                "expected %"PRIusz" bytes > %"PRIusz    \
-                                " remaining bytes",                     \
-                                __len0, rd_kafka_buf_read_remain(rkbuf)); \
-                        (rkbuf)->rkbuf_err = RD_KAFKA_RESP_ERR__BAD_MSG; \
-                        goto err_parse;                                 \
+                        rd_kafka_buf_underflow_fail(rkbuf, __len0);     \
                 }                                                       \
         } while (0)
 
@@ -296,9 +323,8 @@ rd_tmpabuf_write_str0 (const char *func, int line,
                 int64_t _v;                                             \
                 size_t _r = rd_varint_dec_slice(&(rkbuf)->rkbuf_reader, &_v); \
                 if (unlikely(RD_UVARINT_UNDERFLOW(_r)))                 \
-                        rd_kafka_buf_parse_fail(rkbuf,                  \
-                                                "varint parsing failed: " \
-                                                "buffer underflow");    \
+                        rd_kafka_buf_underflow_fail(rkbuf, (size_t)0,   \
+                                                    "varint parsing failed");\
                 *(dst) = _v;                                            \
         } while (0)
 
@@ -351,8 +377,11 @@ rd_tmpabuf_write_str0 (const char *func, int line,
                 int _klen;                                              \
                 rd_kafka_buf_read_i32a(rkbuf, _klen);                   \
                 (kbytes)->len = _klen;                                  \
-                if (RD_KAFKAP_BYTES_LEN(kbytes) == 0)                   \
+                if (RD_KAFKAP_BYTES_IS_NULL(kbytes)) {                  \
                         (kbytes)->data = NULL;                          \
+                        (kbytes)->len = 0;                              \
+                } else if (RD_KAFKAP_BYTES_LEN(kbytes) == 0)            \
+                        (kbytes)->data = "";                            \
                 else if (!((kbytes)->data =                             \
                            rd_slice_ensure_contig(&(rkbuf)->rkbuf_reader, \
                                                   _klen)))              \
@@ -380,15 +409,17 @@ rd_tmpabuf_write_str0 (const char *func, int line,
                 size_t _r = rd_varint_dec_slice(&(rkbuf)->rkbuf_reader, \
                                                 &_len2);                \
                 if (unlikely(RD_UVARINT_UNDERFLOW(_r)))                 \
-                        rd_kafka_buf_parse_fail(rkbuf,                  \
-                                                "varint parsing failed: " \
-                                                "buffer underflow");    \
+                        rd_kafka_buf_underflow_fail(rkbuf, (size_t)0,   \
+                                                    "varint parsing failed"); \
                 (kbytes)->len = (int32_t)_len2;                         \
-                if (RD_KAFKAP_BYTES_LEN(kbytes) == 0)                   \
+                if (RD_KAFKAP_BYTES_IS_NULL(kbytes)) {                  \
                         (kbytes)->data = NULL;                          \
+                        (kbytes)->len = 0;                              \
+                } else if (RD_KAFKAP_BYTES_LEN(kbytes) == 0)            \
+                        (kbytes)->data = "";                            \
                 else if (!((kbytes)->data =                             \
                            rd_slice_ensure_contig(&(rkbuf)->rkbuf_reader, \
-                                                  _len2)))              \
+                                                  (size_t)_len2)))      \
                         rd_kafka_buf_check_len(rkbuf, _len2);           \
         } while (0)
 
@@ -465,7 +496,47 @@ struct rd_kafka_buf_s { /* rd_kafka_buf_t */
 	rd_ts_t rkbuf_ts_enq;
 	rd_ts_t rkbuf_ts_sent;    /* Initially: Absolute time of transmission,
 				   * after response: RTT. */
-	rd_ts_t rkbuf_ts_timeout;
+
+        /* Request timeouts:
+         *  rkbuf_ts_timeout is the effective absolute request timeout used
+         *  by the timeout scanner to see if a request has timed out.
+         *  It is set when a request is enqueued on the broker transmit
+         *  queue based on the relative or absolute timeout:
+         *
+         *  rkbuf_rel_timeout is the per-request-transmit relative timeout,
+         *  this value is reused for each sub-sequent retry of a request.
+         *
+         *  rkbuf_abs_timeout is the absolute request timeout, spanning
+         *  all retries.
+         *  This value is effectively limited by socket.timeout.ms for
+         *  each transmission, but the absolute timeout for a request's
+         *  lifetime is the absolute value.
+         *
+         *  Use rd_kafka_buf_set_timeout() to set a relative timeout
+         *  that will be reused on retry,
+         *  or rd_kafka_buf_set_abs_timeout() to set a fixed absolute timeout
+         *  for the case where the caller knows the request will be
+         *  semantically outdated when that absolute time expires, such as for
+         *  session.timeout.ms-based requests.
+         *
+         * The decision to retry a request is delegated to the rkbuf_cb
+         * response callback, which should use rd_kafka_err_action()
+         * and check the return actions for RD_KAFKA_ERR_ACTION_RETRY to be set
+         * and then call rd_kafka_buf_retry().
+         * rd_kafka_buf_retry() will enqueue the request on the rkb_retrybufs
+         * queue with a backoff time of retry.backoff.ms.
+         * The rkb_retrybufs queue is served by the broker thread's timeout
+         * scanner.
+         * @warning rkb_retrybufs is NOT purged on broker down.
+         */
+        rd_ts_t rkbuf_ts_timeout; /* Request timeout (absolute time). */
+        rd_ts_t rkbuf_abs_timeout;/* Absolute timeout for request, including
+                                   * retries.
+                                   * Mutually exclusive with rkbuf_rel_timeout*/
+        int     rkbuf_rel_timeout;/* Relative timeout (ms), used for retries.
+                                   * Defaults to socket.timeout.ms.
+                                   * Mutually exclusive with rkbuf_abs_timeout*/
+
 
         int64_t rkbuf_offset;     /* Used by OffsetCommit */
 
@@ -494,6 +565,14 @@ struct rd_kafka_buf_s { /* rd_kafka_buf_t */
 
                 } Metadata;
         } rkbuf_u;
+
+        const char *rkbuf_uflow_mitigation; /**< Buffer read underflow
+                                             *   human readable mitigation
+                                             *   string (const memory).
+                                             *   This is used to hint the
+                                             *   user why the underflow
+                                             *   might have occurred, which
+                                             *   depends on request type. */
 };
 
 
@@ -504,6 +583,47 @@ typedef struct rd_kafka_bufq_s {
 } rd_kafka_bufq_t;
 
 #define rd_kafka_bufq_cnt(rkbq) rd_atomic32_get(&(rkbq)->rkbq_cnt)
+
+/**
+ * @brief Set buffer's request timeout to relative \p timeout_ms measured
+ *        from the time the buffer is sent on the underlying socket.
+ *
+ * @param now Reuse current time from existing rd_clock() var, else 0.
+ *
+ * The relative timeout value is reused upon request retry.
+ */
+static RD_INLINE void
+rd_kafka_buf_set_timeout (rd_kafka_buf_t *rkbuf, int timeout_ms, rd_ts_t now) {
+        if (!now)
+                now = rd_clock();
+        rkbuf->rkbuf_rel_timeout = timeout_ms;
+        rkbuf->rkbuf_abs_timeout = 0;
+}
+
+
+/**
+ * @brief Calculate the effective timeout for a request attempt
+ */
+void rd_kafka_buf_calc_timeout (const rd_kafka_t *rk, rd_kafka_buf_t *rkbuf,
+                                rd_ts_t now);
+
+
+/**
+ * @brief Set buffer's request timeout to relative \p timeout_ms measured
+ *        from \p now.
+ *
+ * @param now Reuse current time from existing rd_clock() var, else 0.
+ *
+ * The remaining time is used as timeout for request retries.
+ */
+static RD_INLINE void
+rd_kafka_buf_set_abs_timeout (rd_kafka_buf_t *rkbuf, int timeout_ms,
+                              rd_ts_t now) {
+        if (!now)
+                now = rd_clock();
+        rkbuf->rkbuf_rel_timeout = 0;
+        rkbuf->rkbuf_abs_timeout = now + (timeout_ms * 1000);
+}
 
 
 #define rd_kafka_buf_keep(rkbuf) rd_refcnt_add(&(rkbuf)->rkbuf_refcnt)
@@ -690,6 +810,20 @@ static RD_INLINE void rd_kafka_buf_update_i64 (rd_kafka_buf_t *rkbuf,
 
 
 /**
+ * @brief Write varint-encoded signed value to buffer.
+ */
+static RD_INLINE size_t
+rd_kafka_buf_write_varint (rd_kafka_buf_t *rkbuf, int64_t v) {
+        char varint[RD_UVARINT_ENC_SIZEOF(v)];
+        size_t sz;
+
+        sz = rd_uvarint_enc_i64(varint, sizeof(varint), v);
+
+        return rd_kafka_buf_write(rkbuf, varint, sz);
+}
+
+
+/**
  * Write (copy) Kafka string to buffer.
  */
 static RD_INLINE size_t rd_kafka_buf_write_kstr (rd_kafka_buf_t *rkbuf,
@@ -808,3 +942,5 @@ rd_kafka_buf_version_outdated (const rd_kafka_buf_t *rkbuf, int version) {
         return rkbuf && rkbuf->rkbuf_replyq.version &&
                 rkbuf->rkbuf_replyq.version < version;
 }
+
+#endif /* _RDKAFKA_BUF_H_ */

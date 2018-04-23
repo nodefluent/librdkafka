@@ -38,6 +38,7 @@
 #include "rdkafka_transport.h"
 #include "rdkafka_transport_int.h"
 #include "rdkafka_broker.h"
+#include "rdkafka_interceptor.h"
 
 #include <errno.h>
 
@@ -140,7 +141,7 @@ ssize_t rd_kafka_transport_socket_sendmsg (rd_kafka_transport_t *rktrans,
         rd_slice_get_iov(slice, msg.msg_iov, &iovlen, IOV_MAX,
                          /* FIXME: Measure the effects of this */
                          rktrans->rktrans_sndbuf_size);
-        msg.msg_iovlen = (typeof(msg.msg_iovlen))iovlen;
+        msg.msg_iovlen = (int)iovlen;
 
 #ifdef sun
         /* See recvmsg() comment. Setting it here to be safe. */
@@ -258,7 +259,7 @@ rd_kafka_transport_socket_recvmsg (rd_kafka_transport_t *rktrans,
         rd_buf_get_write_iov(rbuf, msg.msg_iov, &iovlen, IOV_MAX,
                              /* FIXME: Measure the effects of this */
                              rktrans->rktrans_rcvbuf_size);
-        msg.msg_iovlen = (typeof(msg.msg_iovlen))iovlen;
+        msg.msg_iovlen = (int)iovlen;
 
 #ifdef sun
         /* SunOS doesn't seem to set errno when recvmsg() fails
@@ -434,7 +435,14 @@ static void rd_kafka_transport_ssl_lock_cb (int mode, int i,
 }
 
 static unsigned long rd_kafka_transport_ssl_threadid_cb (void) {
-	return (unsigned long)(intptr_t)thrd_current();
+#ifdef _MSC_VER
+        /* Windows makes a distinction between thread handle
+         * and thread id, which means we can't use the
+         * thrd_current() API that returns the handle. */
+        return (unsigned long)GetCurrentThreadId();
+#else
+        return (unsigned long)(intptr_t)thrd_current();
+#endif
 }
 
 
@@ -740,7 +748,7 @@ static int rd_kafka_transport_ssl_verify (rd_kafka_transport_t *rktrans) {
  *
  * Returns -1 on error, 0 if handshake is still in progress, or 1 on completion.
  */
-static int rd_kafka_transport_ssl_handhsake (rd_kafka_transport_t *rktrans) {
+static int rd_kafka_transport_ssl_handshake (rd_kafka_transport_t *rktrans) {
 	rd_kafka_broker_t *rkb = rktrans->rktrans_rkb;
 	char errstr[512];
 	int r;
@@ -913,6 +921,69 @@ int rd_kafka_transport_ssl_ctx_init (rd_kafka_t *rk,
                 }
 	}
 
+	if (rk->rk_conf.ssl.keystore_location) {
+		FILE *fp;
+		EVP_PKEY *pkey;
+		X509 *cert;
+		STACK_OF(X509) *ca = NULL;
+		PKCS12 *p12;
+
+		rd_kafka_dbg(rk, SECURITY, "SSL",
+			     "Loading client's keystore file from %s",
+			     rk->rk_conf.ssl.keystore_location);
+
+		if (!(fp = fopen(rk->rk_conf.ssl.keystore_location, "rb"))) {
+			rd_snprintf(errstr, errstr_size,
+				    "Failed to open ssl.keystore.location: %s: %s", 
+				    rk->rk_conf.ssl.keystore_location, 
+				    rd_strerror(errno));
+			goto fail;
+		}
+
+		p12 = d2i_PKCS12_fp(fp, NULL);
+		fclose(fp);
+		if (!p12) {
+			rd_snprintf(errstr, errstr_size,
+				    "Error reading PKCS#12 file: ");
+			goto fail;
+		}
+
+		pkey = EVP_PKEY_new();
+		cert = X509_new();
+		if (!PKCS12_parse(p12, rk->rk_conf.ssl.keystore_password, &pkey, &cert, &ca)) {
+			EVP_PKEY_free(pkey);
+			X509_free(cert);
+			PKCS12_free(p12);
+			if (ca != NULL)
+				sk_X509_pop_free(ca, X509_free);
+			rd_snprintf(errstr, errstr_size,
+				    "Failed to parse PKCS#12 file: %s: ",
+				    rk->rk_conf.ssl.keystore_location);
+			goto fail;
+		}
+
+		if (ca != NULL)
+			sk_X509_pop_free(ca, X509_free);
+
+		PKCS12_free(p12);
+
+		r = SSL_CTX_use_certificate(ctx, cert);
+		X509_free(cert);
+		if (r != 1) {
+			EVP_PKEY_free(pkey);
+			rd_snprintf(errstr, errstr_size,
+				    "Failed to use ssl.keystore.location certificate: ");
+			goto fail;
+		}
+
+		r = SSL_CTX_use_PrivateKey(ctx, pkey);
+		EVP_PKEY_free(pkey);
+		if (r != 1) {
+			rd_snprintf(errstr, errstr_size,
+				    "Failed to use ssl.keystore.location private key: ");
+			goto fail;
+		}
+	}
 
 	SSL_CTX_set_mode(ctx, SSL_MODE_ENABLE_PARTIAL_WRITE);
 
@@ -962,6 +1033,26 @@ rd_kafka_transport_recv (rd_kafka_transport_t *rktrans, rd_buf_t *rbuf,
 
 
 
+/**
+ * @brief Notify transport layer of full request sent.
+ */
+void rd_kafka_transport_request_sent (rd_kafka_broker_t *rkb,
+                                      rd_kafka_buf_t *rkbuf) {
+        rd_kafka_transport_t *rktrans = rkb->rkb_transport;
+
+        /* Call on_request_sent interceptors */
+        rd_kafka_interceptors_on_request_sent(
+                rkb->rkb_rk,
+                rktrans->rktrans_s,
+                rkb->rkb_name, rkb->rkb_nodeid,
+                rkbuf->rkbuf_reqhdr.ApiKey,
+                rkbuf->rkbuf_reqhdr.ApiVersion,
+                rkbuf->rkbuf_corrid,
+                rd_slice_size(&rkbuf->rkbuf_reader));
+}
+
+
+
 
 /**
  * Length framed receive handling.
@@ -978,7 +1069,7 @@ int rd_kafka_transport_framed_recv (rd_kafka_transport_t *rktrans,
                                     char *errstr, size_t errstr_size) {
 	rd_kafka_buf_t *rkbuf = rktrans->rktrans_recv_buf;
 	ssize_t r;
-	const int log_decode_errors = 0;
+	const int log_decode_errors = LOG_ERR;
 
 	/* States:
 	 *   !rktrans_recv_buf: initial state; set up buf to receive header.
@@ -1205,7 +1296,7 @@ static void rd_kafka_transport_io_event (rd_kafka_transport_t *rktrans,
 		if (rktrans->rktrans_ssl) {
 			/* Currently setting up SSL connection:
 			 * perform handshake. */
-			rd_kafka_transport_ssl_handhsake(rktrans);
+			rd_kafka_transport_ssl_handshake(rktrans);
 			return;
 		}
 #endif

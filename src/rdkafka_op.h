@@ -25,7 +25,8 @@
  * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
  * POSSIBILITY OF SUCH DAMAGE.
  */
-#pragma once
+#ifndef _RDKAFKA_OP_H_
+#define _RDKAFKA_OP_H_
 
 
 #include "rdkafka_msg.h"
@@ -282,7 +283,11 @@ struct rd_kafka_op_s {
 		} xbuf; /* XMIT_BUF and RECV_BUF */
 
                 /* RD_KAFKA_OP_METADATA */
-                rd_kafka_metadata_t *metadata;
+                struct {
+                        rd_kafka_metadata_t *md;
+                        int force; /* force request regardless of outstanding
+                                    * metadata requests. */
+                } metadata;
 
 		struct {
 			shptr_rd_kafka_itopic_t *s_rkt;
@@ -394,3 +399,5 @@ void rd_kafka_op_print (FILE *fp, const char *prefix, rd_kafka_op_t *rko);
 
 void rd_kafka_op_offset_store (rd_kafka_t *rk, rd_kafka_op_t *rko,
 			       const rd_kafka_message_t *rkmessage);
+
+#endif /* _RDKAFKA_OP_H_ */

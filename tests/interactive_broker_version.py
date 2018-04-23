@@ -45,7 +45,7 @@ def test_version (version, cmd=None, deploy=True, conf={}, debug=False, exec_cnt
     if 'GSSAPI' in args.conf.get('sasl_mechanisms', []):
         KerberosKdcApp(cluster, 'MYREALM').start()
 
-    defconf = {'replication_factor': min(broker_cnt, 3), 'num_partitions': 4, 'version': version}
+    defconf = {'replication_factor': min(int(conf.get('replication_factor', broker_cnt)), 3), 'num_partitions': 4, 'version': version}
     defconf.update(conf)
 
     print('conf: ', defconf)
@@ -121,12 +121,27 @@ def test_version (version, cmd=None, deploy=True, conf={}, debug=False, exec_cnt
 
     print('# Connect to cluster with bootstrap.servers %s' % bootstrap_servers)
 
-    cmd_env = 'export KAFKA_PATH="%s" RDKAFKA_TEST_CONF="%s" ZK_ADDRESS="%s" BROKERS="%s" TEST_KAFKA_VERSION="%s" TRIVUP_ROOT="%s"; ' % \
-              (brokers[0].conf.get('destdir'), test_conf_file, zk_address, bootstrap_servers, version, cluster.instance_path())
+    cmd_env = os.environ.copy()
+    cmd_env['KAFKA_PATH'] = brokers[0].conf.get('destdir')
+    cmd_env['RDKAFKA_TEST_CONF'] = test_conf_file
+    cmd_env['ZK_ADDRESS'] = zk_address
+    cmd_env['BROKERS'] = bootstrap_servers
+    cmd_env['TEST_KAFKA_VERSION'] = version
+    cmd_env['TRIVUP_ROOT'] = cluster.instance_path()
+    # Add each broker pid as an env so they can be killed indivdidually.
+    for b in [x for x in cluster.apps if isinstance(x, KafkaBrokerApp)]:
+        cmd_env['BROKER_PID_%d' % b.appid] = str(b.proc.pid)
+
     if not cmd:
         cmd = 'bash --rcfile <(cat ~/.bashrc; echo \'PS1="[TRIVUP:%s@%s] \\u@\\h:\w$ "\')' % (cluster.name, version)
+
+    ret = True
+
     for i in range(0, exec_cnt):
-        subprocess.call('%s %s' % (cmd_env, cmd), shell=True, executable='/bin/bash')
+        retcode = subprocess.call(cmd, env=cmd_env, shell=True, executable='/bin/bash')
+        if retcode != 0:
+            print('# Command failed with returncode %d: %s' % (retcode, cmd))
+            ret = False
 
     try:
         os.remove(test_conf_file)
@@ -136,7 +151,7 @@ def test_version (version, cmd=None, deploy=True, conf={}, debug=False, exec_cnt
     cluster.stop(force=True)
 
     cluster.cleanup(keeptypes=['log'])
-    return True
+    return ret
 
 if __name__ == '__main__':
 
@@ -181,7 +196,13 @@ if __name__ == '__main__':
 
     args.conf.get('conf', list()).append("log.retention.bytes=1000000000")
 
+    retcode = 0
     for version in args.versions:
-        test_version(version, cmd=args.cmd, deploy=args.deploy,
-                     conf=args.conf, debug=args.debug, exec_cnt=args.exec_cnt,
-                     root_path=args.root, broker_cnt=args.broker_cnt)
+        r = test_version(version, cmd=args.cmd, deploy=args.deploy,
+                         conf=args.conf, debug=args.debug, exec_cnt=args.exec_cnt,
+                         root_path=args.root, broker_cnt=args.broker_cnt)
+        if not r:
+            retcode = 2
+
+
+    sys.exit(retcode)

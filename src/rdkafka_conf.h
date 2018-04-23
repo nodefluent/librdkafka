@@ -1,4 +1,5 @@
-#pragma once
+#ifndef _RDKAFKA_CONF_H_
+#define _RDKAFKA_CONF_H_
 
 #include "rdlist.h"
 
@@ -99,6 +100,7 @@ struct rd_kafka_conf_s {
 	int     term_sig;
         int     reconnect_jitter_ms;
 	int     api_version_request;
+	int     api_version_request_timeout_ms;
 	int     api_version_fallback_ms;
 	char   *broker_version_fallback;
 	rd_kafka_secproto_t security_protocol;
@@ -112,6 +114,8 @@ struct rd_kafka_conf_s {
 		char *cert_location;
 		char *ca_location;
 		char *crl_location;
+		char *keystore_location;
+		char *keystore_password;
 	} ssl;
 #endif
 
@@ -155,6 +159,7 @@ struct rd_kafka_conf_s {
                 rd_list_t on_acknowledgement; /* .. (copied) */
                 rd_list_t on_consume;         /* .. (copied) */
                 rd_list_t on_commit;          /* .. (copied) */
+                rd_list_t on_request_sent;    /* .. (copied) */
 
                 /* rd_strtup_t list */
                 rd_list_t config;             /* Configuration name=val's
@@ -174,6 +179,7 @@ struct rd_kafka_conf_s {
         int64_t queued_max_msg_bytes;
 	int    fetch_wait_max_ms;
         int    fetch_msg_max_bytes;
+        int    fetch_max_bytes;
 	int    fetch_min_bytes;
 	int    fetch_error_backoff_ms;
         char  *group_id_str;
@@ -212,6 +218,7 @@ struct rd_kafka_conf_s {
 	int    queue_buffering_max_msgs;
 	int    queue_buffering_max_kbytes;
 	int    buffering_max_ms;
+        int    queue_backpressure_thres;
 	int    max_retries;
 	int    retry_backoff_ms;
 	int    batch_num_messages;
@@ -288,6 +295,9 @@ struct rd_kafka_conf_s {
 
 	/* Opaque passed to callbacks. */
 	void  *opaque;
+
+        /* For use with value-less properties. */
+        int     dummy;
 };
 
 int rd_kafka_socket_cb_linux (int domain, int type, int protocol, void *opaque);
@@ -312,6 +322,10 @@ struct rd_kafka_topic_conf_s {
 				int32_t partition_cnt,
 				void *rkt_opaque,
 				void *msg_opaque);
+        char   *partitioner_str;
+
+        int queuing_strategy; /* RD_KAFKA_QUEUE_FIFO|LIFO */
+        int (*msg_order_cmp) (const void *a, const void *b);
 
 	rd_kafka_compression_t compression_codec;
         int     produce_offset_report;
@@ -332,3 +346,5 @@ struct rd_kafka_topic_conf_s {
 
 
 void rd_kafka_anyconf_destroy (int scope, void *conf);
+
+#endif /* _RDKAFKA_CONF_H_ */

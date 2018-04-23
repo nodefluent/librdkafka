@@ -12,6 +12,9 @@ Source:	 librdkafka-%{version}.tar.gz
 BuildRequires: zlib-devel libstdc++-devel gcc >= 4.1 gcc-c++ openssl-devel cyrus-sasl-devel lz4-devel python
 BuildRoot: %(mktemp -ud %{_tmppath}/%{name}-%{version}-%{release}-XXXXXX)
 
+%define _source_payload w9.gzdio
+%define _binary_payload w9.gzdio
+
 %description
 librdkafka is the C/C++ client library implementation of the Apache Kafka protocol, containing both Producer and Consumer support.
 
@@ -84,7 +87,8 @@ rm -rf %{buildroot}
 %{_libdir}/librdkafka++.so
 %{_libdir}/pkgconfig/rdkafka++.pc
 %{_libdir}/pkgconfig/rdkafka.pc
-
+%{_libdir}/pkgconfig/rdkafka-static.pc
+%{_libdir}/pkgconfig/rdkafka++-static.pc
 
 %changelog
 * Thu Apr 09 2015 Eduard Iskandarov <e.iskandarov@corp.mail.ru> 0.8.6-0
